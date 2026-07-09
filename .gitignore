@@ -1,7 +1,10 @@
-# Large data files - exceed GitHub limits (store externally)
-from iati-levin/04_image_processing/00_data/uav_flight_hsi.zip
-from iati-levin/04_image_processing/00_data/rg_on_sand_induction_54m/raw_0
-from iati-levin/04_image_processing/00_data/rg_on_sand_induction_54m/raw_0_rd
-from iati-levin/04_image_processing/00_data/rg_on_sand_induction_54m/raw_0_rd_rf
-from iati-levin/04_image_processing/00_data/rg_on_sand_induction_54m/raw_0_rd_rf_or
-from iati-levin/04_image_processing/00_data/rg_on_sand_induction_54m/darkreference/raw_0
+# Python
+.venv/
+venv/
+__pycache__/
+*.pyc
+
+# Local data / large binaries (keep out of git; store externally)
+# Add your data folder(s) here, e.g.:
+# data/
+*.zip
