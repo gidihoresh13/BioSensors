@@ -5,10 +5,9 @@ A minimal **desktop GUI** (Tkinter) with two tabs:
 - **Detection** -- load a hyperspectral cube, pick a reference spectrum, run the
   unmixing classifier, tune the detection threshold live, inspect per-pixel
   spectra, and export results.
-- **Spectrum sampler** -- load a *separate* hyperspectral image, draw a polygon
-  on it, preview the **mean spectrum** of the enclosed pixels on a graph, and
-  save it to a `.npy` you name. That file is a ready-made reference spectrum for
-  the Detection tab.
+- **Spectrum sampler** -- load a *separate* hyperspectral image and draw three
+  polygons: **P1** sets a min-max normalization, **P2** and **P3** are normalized
+  by it and **subtracted**; export the difference spectrum to CSV.
 
 This folder is **self-contained** -- it ships its own copy of the detection
 engine (the [`hsi_detect`](hsi_detect) package), so it has no dependency on
@@ -29,27 +28,41 @@ Layout: **RGB | detection score | pixel spectrum**.
 
 ## Tab 2 -- Spectrum sampler
 
-Builds a reference spectrum by averaging a hand-drawn region of a hyperspectral
+Builds a **difference spectrum** from three hand-drawn regions of a hyperspectral
 image. It is fully **independent** of the Detection tab -- open any cube here,
 including a different one from the detection cube.
 
-> **The image must be a hyperspectral cube (ENVI `.hdr`).** A "mean spectrum"
+> **The image must be a hyperspectral cube (ENVI `.hdr`).** A mean *spectrum*
 > only exists if the file has spectral bands; an ordinary RGB photo has just
 > three channels and cannot produce one.
 
+The idea: sample three regions. **P1** is a normalizer -- its mean reflectance's
+min and max define a **Spectronon-style min-max normalization applied to the whole
+image**: `N = (value - min(P1)) / (max(P1) - min(P1))`. **P2** and **P3** are two
+regions sampled from that normalized image; one is subtracted from the other and
+the difference is exported. (Because min-max is a linear rescale, sampling P2/P3
+after normalization gives the same result as averaging each region then rescaling
+by P1's min/max -- which is how it's computed.)
+
 1. **Open image (.hdr)** -- loads the cube at full resolution and renders it
    (left panel), so region boundaries stay precise.
-2. **Sample polygon** (button turns into *Stop sampling*).
-3. Click on the image to drop vertices; click the first vertex to close the
-   shape. Press **Esc** to discard and restart the current shape.
-4. The **mean spectrum** of every pixel inside the polygon is graphed live in the
-   right panel. Dragging a vertex re-computes it, so you can preview before saving.
-5. **Save mean spectrum (.npy)...** -- type a filename and save. The default
-   `.npy` is a 2xN array (row 0 = wavelengths, row 1 = intensities) that loads
-   straight back via **Open reference** on the Detection tab. `.csv` is also
-   offered.
+2. Pick the **store into** slot (`P1 (normalizer)`, `P2`, or `P3`).
+3. **Sample polygon** (button turns into *Stop sampling*); click vertices on the
+   image, click the first vertex to close (Esc restarts the shape). The polygon's
+   **mean reflectance** is stored into the selected slot.
+4. Repeat for the other slots. Once **P1** is set, P2/P3 are shown min-max
+   normalized: `N = (mean - min(P1)) / (max(P1) - min(P1))`.
+5. Choose the **Subtract** direction (`P2 - P3` or `P3 - P2`). Once all three
+   slots are filled, the difference `N2 - N3` (or `N3 - N2`) is drawn in bold.
+6. **Export difference (CSV)...** -- writes a 2-column CSV: `wavelength` and the
+   subtracted spectrum (header names the direction, e.g. `wavelength,P2-P3`).
 
-Layout: **image (draw here) | mean spectrum (preview)**.
+Extras: **Clear P1/P2/P3** resets the slots; **Save current mean (.npy)...** saves
+the last-drawn polygon's raw mean reflectance as a 2xN `.npy`/`.csv` (loads back
+via the Detection tab's *Open reference*). No absorbance or continuum removal is
+applied -- these are raw reflectance means.
+
+Layout: **image (draw here) | normalized means + difference**.
 
 ### Zooming the image
 

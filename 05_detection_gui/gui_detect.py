@@ -13,13 +13,17 @@ TAB 1 - "Detection"
   6. Export                -> saves score TIFF + heatmap PNG + params JSON
 
 TAB 2 - "Spectrum sampler"  (independent of the detection cube)
+  Builds a difference spectrum from three polygons on one image:
   1. Open image (.hdr)     -> loads a SEPARATE ENVI hyperspectral cube
   2. Zoom                   -> mouse wheel zooms on the image (cursor-centered);
                               nav toolbar adds pan / zoom-rectangle / Home reset
-  3. Sample polygon        -> draw a polygon on that image
-  4. Preview               -> the mean spectrum of the enclosed pixels is graphed live
-  5. Save mean spectrum    -> write it to a .npy (or .csv) with a name you choose;
-                              the 2xN .npy layout loads straight back as a reference
+  3. Sample P1 (normalizer) -> its mean reflectance's min & max define a Spectronon-
+                              style min-max normalization of the WHOLE image:
+                              Nx = (Rx - min(R1)) / (max(R1) - min(R1))
+  4. Sample P2 and P3      -> sampled after normalization (each normalized by P1's
+                              min/max; equivalent to averaging then rescaling)
+  5. Subtract              -> N2 - N3  (or N3 - N2; direction is selectable)
+  6. Export (CSV)          -> writes wavelength + the subtracted spectrum
 
 This folder is self-contained: it ships its own copy of the `hsi_detect`
 package (in `./hsi_detect`), so it does not depend on any other module.
@@ -77,9 +81,12 @@ class DetectorGUI:
         self.samp_hsi = None       # separate HyperspectralImage for sampling
         self.samp_selector = None  # matplotlib PolygonSelector while active
         self.samp_active = False   # True while in polygon-drawing mode
-        self.sampled_wl = None     # 1D wavelengths of the last mean spectrum
-        self.sampled_spec = None   # 1D mean intensities of the last polygon
-        self.sampled_n = 0         # number of pixels averaged
+        self.samp_wl = None        # wavelengths (cube band centers)
+        # raw mean reflectance per polygon slot; P1 = normalizer, P2/P3 subtracted
+        self.samp_slots = {"P1": None, "P2": None, "P3": None}
+        self.samp_slot_n = {"P1": 0, "P2": 0, "P3": 0}   # pixel counts per slot
+        self.current_mean = None   # raw mean reflectance of the last-drawn polygon
+        self.current_n = 0
 
         self.q = queue.Queue()     # worker -> UI messages
 
@@ -165,18 +172,39 @@ class DetectorGUI:
         self.samp_poly_btn = ttk.Button(bar, text="Sample polygon",
                                         command=self.toggle_polygon)
         self.samp_poly_btn.pack(side=tk.LEFT, padx=(12, 0))
-        self.samp_save_btn = ttk.Button(bar, text="Save mean spectrum (.npy)...",
-                                        command=self.save_spectrum)
-        self.samp_save_btn.pack(side=tk.LEFT, padx=(6, 0))
 
-        # figure: RGB (draw here) | mean spectrum (preview)
+        # which slot the next completed polygon fills. P1 = normalizer.
+        ttk.Label(bar, text="  store into:").pack(side=tk.LEFT, padx=(12, 2))
+        self.samp_target = tk.StringVar(value="P1")
+        for val, txt in (("P1", "P1 (normalizer)"), ("P2", "P2"), ("P3", "P3")):
+            ttk.Radiobutton(bar, text=txt, value=val,
+                            variable=self.samp_target).pack(side=tk.LEFT)
+
+        # second row: subtraction direction, export, clear
+        bar2 = ttk.Frame(parent, padding=(6, 0))
+        bar2.pack(side=tk.TOP, fill=tk.X)
+        ttk.Label(bar2, text="Subtract:").pack(side=tk.LEFT)
+        self.samp_dir = tk.StringVar(value="P2 - P3")
+        dir_cb = ttk.Combobox(bar2, textvariable=self.samp_dir, width=9, state="readonly",
+                              values=["P2 - P3", "P3 - P2"])
+        dir_cb.pack(side=tk.LEFT, padx=(4, 0))
+        dir_cb.bind("<<ComboboxSelected>>", lambda _=None: self._update_diff_plot())
+        ttk.Button(bar2, text="Export difference (CSV)...",
+                   command=self.export_difference).pack(side=tk.LEFT, padx=(12, 0))
+        ttk.Button(bar2, text="Clear P1/P2/P3",
+                   command=self.clear_slots).pack(side=tk.LEFT, padx=(6, 0))
+        ttk.Button(bar2, text="Save current mean (.npy)...",
+                   command=self.save_spectrum).pack(side=tk.LEFT, padx=(6, 0))
+
+        # figure: RGB (draw here) | normalized means + difference
         self.samp_fig = Figure(figsize=(11, 5.2), constrained_layout=True)
         self.samp_ax_rgb = self.samp_fig.add_subplot(1, 2, 1)
         self.samp_ax_spec = self.samp_fig.add_subplot(1, 2, 2)
         self.samp_ax_rgb.set_title("image (open one to begin)")
         self.samp_ax_rgb.axis("off")
-        self.samp_ax_spec.set_title("mean spectrum")
+        self.samp_ax_spec.set_title("normalized means + difference")
         self.samp_ax_spec.set_xlabel("wavelength (nm)")
+        self.samp_ax_spec.set_ylabel("normalized reflectance")
 
         self.samp_canvas = FigureCanvasTkAgg(self.samp_fig, master=parent)
 
@@ -234,12 +262,15 @@ class DetectorGUI:
                 elif kind == "samp_cube_done":
                     self.samp_hsi = payload
                     self._deactivate_polygon()       # drop any stale selector
-                    self.sampled_spec = None
+                    self.samp_slots = {"P1": None, "P2": None, "P3": None}
+                    self.samp_slot_n = {"P1": 0, "P2": 0, "P3": 0}
+                    self.current_mean = None
+                    self.samp_wl = np.asarray(self.samp_hsi.centers, dtype=float)
                     self._draw_samp_rgb()
-                    self._clear_samp_spectrum()
+                    self._update_diff_plot()
                     self._samp_busy(False)
                     self._set_status(f"Image loaded: {self.samp_hsi.image.shape}. "
-                                     "Click 'Sample polygon' and draw on the image.")
+                                     "Select a slot (P1/P2/P3), click 'Sample polygon' and draw.")
                 elif kind == "error":
                     self._busy(False)
                     messagebox.showerror("Error", payload)
@@ -450,12 +481,6 @@ class DetectorGUI:
         ax.set_ylim(new_ylim)
         self.samp_canvas.draw_idle()
 
-    def _clear_samp_spectrum(self):
-        self.samp_ax_spec.clear()
-        self.samp_ax_spec.set_title("mean spectrum")
-        self.samp_ax_spec.set_xlabel("wavelength (nm)")
-        self.samp_canvas.draw_idle()
-
     def toggle_polygon(self):
         """Enter/leave polygon-drawing mode on the sampler image."""
         if self.samp_hsi is None:
@@ -516,44 +541,122 @@ class DetectorGUI:
             self._set_status("Polygon encloses no pixels - draw a larger shape.")
             return
         pixels = self.samp_hsi.image[mask]            # (n_pixels, n_bands)
-        mean_spec = np.nanmean(pixels, axis=0)
-        self.sampled_wl = np.asarray(self.samp_hsi.centers, dtype=float)
-        self.sampled_spec = np.asarray(mean_spec, dtype=float)
-        self.sampled_n = int(mask.sum())
-        self._plot_sampled_spectrum()
-        self._set_status(f"Mean spectrum from {self.sampled_n} pixels - preview updated. "
-                         "Adjust the polygon or click 'Save mean spectrum'.")
+        self.samp_wl = np.asarray(self.samp_hsi.centers, dtype=float)
+        self.current_mean = np.asarray(np.nanmean(pixels, axis=0), dtype=float)
+        self.current_n = int(mask.sum())
+        # store this polygon's raw mean reflectance into the selected slot
+        target = self.samp_target.get()
+        self.samp_slots[target] = self.current_mean.copy()
+        self.samp_slot_n[target] = self.current_n
+        self._update_diff_plot()
+        self._set_status(f"Stored {self.current_n}px into {target}.  "
+                         f"slots: {self._slots_summary()}.  "
+                         "Pick the next slot & draw, or Export difference (CSV).")
 
-    def _plot_sampled_spectrum(self):
-        self.samp_ax_spec.clear()
-        self.samp_ax_spec.set_title(f"mean spectrum (n={self.sampled_n} pixels)")
-        self.samp_ax_spec.plot(self.sampled_wl, self.sampled_spec, "r-", lw=1.4,
-                               label="polygon mean")
-        self.samp_ax_spec.set_xlabel("wavelength (nm)")
-        self.samp_ax_spec.set_ylabel("intensity")
-        self.samp_ax_spec.legend(fontsize=8)
+    # ---- normalization + difference ----
+    def _norm_by_p1(self, mean):
+        """Min-max normalize `mean` using P1's own min & max. None if P1 unset/flat."""
+        m1 = self.samp_slots["P1"]
+        if m1 is None or mean is None:
+            return None
+        lo, hi = np.nanmin(m1), np.nanmax(m1)
+        denom = hi - lo
+        if not np.isfinite(denom) or denom == 0:
+            return None
+        return (mean - lo) / denom
+
+    def _difference(self):
+        """N2 - N3 (or N3 - N2), both normalized by P1. None if not all set."""
+        n2 = self._norm_by_p1(self.samp_slots["P2"])
+        n3 = self._norm_by_p1(self.samp_slots["P3"])
+        if n2 is None or n3 is None:
+            return None
+        return (n2 - n3) if self.samp_dir.get() == "P2 - P3" else (n3 - n2)
+
+    def _slots_summary(self):
+        return " ".join(f"{k}[{'set' if self.samp_slots[k] is not None else '-'}]"
+                        for k in ("P1", "P2", "P3"))
+
+    def _update_diff_plot(self):
+        ax = self.samp_ax_spec
+        ax.clear()
+        ax.set_xlabel("wavelength (nm)")
+        wl = self.samp_wl
+        have_p1 = self.samp_slots["P1"] is not None
+        colors = {"P1": "0.6", "P2": "tab:blue", "P3": "tab:green"}
+        any_slot = False
+        for key in ("P1", "P2", "P3"):
+            m = self.samp_slots[key]
+            if m is None or wl is None:
+                continue
+            any_slot = True
+            y = self._norm_by_p1(m) if have_p1 else m
+            if y is None:
+                continue
+            n = self.samp_slot_n[key]
+            if key == "P1":
+                ax.plot(wl, y, ":", color=colors[key], lw=1.0,
+                        label=f"P1 normalizer (n={n})")
+            else:
+                lbl = f"{key} norm (n={n})" if have_p1 else f"{key} raw (n={n})"
+                ax.plot(wl, y, "-", color=colors[key], lw=1.0, label=lbl)
+        diff = self._difference()
+        if diff is not None:
+            ax.plot(wl, diff, "r-", lw=1.7, label=self.samp_dir.get())
+            ax.axhline(0.0, color="0.85", lw=0.8, zorder=0)
+            ax.set_ylabel("min-max normalized (by P1) / difference")
+            ax.set_title(f"difference {self.samp_dir.get()}")
+        else:
+            ax.set_ylabel("min-max normalized (by P1)" if have_p1 else "reflectance (raw)")
+            ax.set_title("sample P1 (normalizer), then P2 and P3")
+        if any_slot:
+            ax.legend(fontsize=7)
         self.samp_canvas.draw_idle()
 
+    def export_difference(self):
+        diff = self._difference()
+        if diff is None:
+            messagebox.showwarning(
+                "Not ready",
+                "Need P1 (normalizer), P2 and P3 all sampled first.\n"
+                f"Current: {self._slots_summary()}")
+            return
+        path = filedialog.asksaveasfilename(
+            title="Export subtracted spectrum",
+            defaultextension=".csv", filetypes=[("CSV", "*.csv"), ("All files", "*.*")])
+        if not path:
+            return
+        col = self.samp_dir.get().replace(" ", "")   # e.g. P2-P3
+        np.savetxt(path, np.column_stack([self.samp_wl, diff]), delimiter=",",
+                   header=f"wavelength,{col}", comments="")
+        self._set_status(f"Exported {self.samp_dir.get()} difference "
+                         f"({len(diff)} bands) to {os.path.basename(path)}")
+
+    def clear_slots(self):
+        self.samp_slots = {"P1": None, "P2": None, "P3": None}
+        self.samp_slot_n = {"P1": 0, "P2": 0, "P3": 0}
+        self._update_diff_plot()
+        self._set_status("Cleared P1/P2/P3. Sample again.")
+
     def save_spectrum(self):
-        if self.sampled_spec is None:
+        """Save the last-drawn polygon's raw mean reflectance as a 2xN .npy/.csv."""
+        if self.current_mean is None:
             messagebox.showwarning("Nothing to save",
                                    "Sample a polygon first (draw one on the image).")
             return
         path = filedialog.asksaveasfilename(
-            title="Save mean spectrum as",
+            title="Save current polygon mean as",
             defaultextension=".npy",
             filetypes=[("NumPy 2xN", "*.npy"), ("CSV", "*.csv")])
         if not path:
             return
-        wl, inten = self.sampled_wl, self.sampled_spec
+        wl, inten = self.samp_wl, self.current_mean
         if path.lower().endswith(".csv"):
             np.savetxt(path, np.column_stack([wl, inten]), delimiter=",",
-                       header="wavelength,intensity", comments="")
+                       header="wavelength,mean_reflectance", comments="")
         else:
-            # 2xN layout (row 0 = wavelengths, row 1 = intensities) ->
-            # loads straight back as a Spectrum / detection reference.
             np.save(path, np.stack([wl, inten]))
-        self._set_status(f"Saved mean spectrum ({len(wl)} bands, {self.sampled_n} px) "
+        self._set_status(f"Saved current polygon mean ({len(wl)} bands, {self.current_n} px) "
                          f"to {os.path.basename(path)}")
 
 
