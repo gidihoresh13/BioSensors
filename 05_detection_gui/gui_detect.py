@@ -9,20 +9,19 @@ TAB 1 - "Detection"
   2. Open reference        -> loads a 2xN .npy/.csv reference spectrum
   3. Run detection         -> fit/classify on a background thread (UI stays live)
   4. Threshold slider      -> re-applies threshold on the cached score map (no re-fit)
-  5. Click a pixel         -> plots that pixel's spectrum vs. the reference
+  5. Click a pixel         -> plots its spectrum vs. the reference; after detection
+                              it also marks the pixel and its detection score on
+                              the score map (and in the status bar)
   6. Export                -> saves score TIFF + heatmap PNG + params JSON
 
 TAB 2 - "Spectrum sampler"  (independent of the detection cube)
-  Builds a difference spectrum from three polygons on one image:
+  Builds a difference spectrum from two polygons on one normalized image:
   1. Open image (.hdr)     -> loads a SEPARATE ENVI hyperspectral cube
-  2. Zoom                   -> mouse wheel zooms on the image (cursor-centered);
+  2. Normalize (/max)      -> button; divides the whole image by its max pixel value
+  3. Zoom                   -> mouse wheel zooms on the image (cursor-centered);
                               nav toolbar adds pan / zoom-rectangle / Home reset
-  3. Sample P1 (normalizer) -> its mean reflectance's min & max define a Spectronon-
-                              style min-max normalization of the WHOLE image:
-                              Nx = (Rx - min(R1)) / (max(R1) - min(R1))
-  4. Sample P2 and P3      -> sampled after normalization (each normalized by P1's
-                              min/max; equivalent to averaging then rescaling)
-  5. Subtract              -> N2 - N3  (or N3 - N2; direction is selectable)
+  4. Sample A and B        -> two polygons; each region's mean reflectance / max
+  5. Subtract              -> A - B  (or B - A; direction is selectable)
   6. Export (CSV)          -> writes wavelength + the subtracted spectrum
 
 This folder is self-contained: it ships its own copy of the `hsi_detect`
@@ -76,15 +75,20 @@ class DetectorGUI:
         self.ref_path = None       # path to reference spectrum file
         self.ref_disp = None       # Spectrum for display (interp to cube if loaded)
         self.raw_scores = None     # 2D float score map (unthresholded)
+        self.picked_xy = None      # last-clicked pixel (x, y) marked on the score map
+        self.score_im = None       # AxesImage of the score map (kept for updates)
+        self.score_cbar = None     # colorbar (value scale) beside the score map
+        self.pick_artists = []     # marker + label artists on the score map
 
         # ---- spectrum-sampler-tab state (independent of the detection cube) ----
         self.samp_hsi = None       # separate HyperspectralImage for sampling
         self.samp_selector = None  # matplotlib PolygonSelector while active
         self.samp_active = False   # True while in polygon-drawing mode
         self.samp_wl = None        # wavelengths (cube band centers)
-        # raw mean reflectance per polygon slot; P1 = normalizer, P2/P3 subtracted
-        self.samp_slots = {"P1": None, "P2": None, "P3": None}
-        self.samp_slot_n = {"P1": 0, "P2": 0, "P3": 0}   # pixel counts per slot
+        self.samp_gmax = None      # global max of the loaded image (divide-by-max divisor)
+        # raw mean reflectance per polygon slot; the image is normalized by samp_gmax
+        self.samp_slots = {"A": None, "B": None}
+        self.samp_slot_n = {"A": 0, "B": 0}   # pixel counts per slot
         self.current_mean = None   # raw mean reflectance of the last-drawn polygon
         self.current_n = 0
 
@@ -169,29 +173,33 @@ class DetectorGUI:
                                         command=self.open_sample_image)
         self.samp_open_btn.pack(side=tk.LEFT)
 
+        self.samp_norm_btn = ttk.Button(bar, text="Normalize (/max)",
+                                        command=self.normalize_image)
+        self.samp_norm_btn.pack(side=tk.LEFT, padx=(6, 0))
+
         self.samp_poly_btn = ttk.Button(bar, text="Sample polygon",
                                         command=self.toggle_polygon)
         self.samp_poly_btn.pack(side=tk.LEFT, padx=(12, 0))
 
-        # which slot the next completed polygon fills. P1 = normalizer.
+        # which of the two slots the next completed polygon fills
         ttk.Label(bar, text="  store into:").pack(side=tk.LEFT, padx=(12, 2))
-        self.samp_target = tk.StringVar(value="P1")
-        for val, txt in (("P1", "P1 (normalizer)"), ("P2", "P2"), ("P3", "P3")):
-            ttk.Radiobutton(bar, text=txt, value=val,
+        self.samp_target = tk.StringVar(value="A")
+        for val in ("A", "B"):
+            ttk.Radiobutton(bar, text=val, value=val,
                             variable=self.samp_target).pack(side=tk.LEFT)
 
         # second row: subtraction direction, export, clear
         bar2 = ttk.Frame(parent, padding=(6, 0))
         bar2.pack(side=tk.TOP, fill=tk.X)
         ttk.Label(bar2, text="Subtract:").pack(side=tk.LEFT)
-        self.samp_dir = tk.StringVar(value="P2 - P3")
-        dir_cb = ttk.Combobox(bar2, textvariable=self.samp_dir, width=9, state="readonly",
-                              values=["P2 - P3", "P3 - P2"])
+        self.samp_dir = tk.StringVar(value="A - B")
+        dir_cb = ttk.Combobox(bar2, textvariable=self.samp_dir, width=7, state="readonly",
+                              values=["A - B", "B - A"])
         dir_cb.pack(side=tk.LEFT, padx=(4, 0))
         dir_cb.bind("<<ComboboxSelected>>", lambda _=None: self._update_diff_plot())
         ttk.Button(bar2, text="Export difference (CSV)...",
                    command=self.export_difference).pack(side=tk.LEFT, padx=(12, 0))
-        ttk.Button(bar2, text="Clear P1/P2/P3",
+        ttk.Button(bar2, text="Clear A/B",
                    command=self.clear_slots).pack(side=tk.LEFT, padx=(6, 0))
         ttk.Button(bar2, text="Save current mean (.npy)...",
                    command=self.save_spectrum).pack(side=tk.LEFT, padx=(6, 0))
@@ -204,7 +212,7 @@ class DetectorGUI:
         self.samp_ax_rgb.axis("off")
         self.samp_ax_spec.set_title("normalized means + difference")
         self.samp_ax_spec.set_xlabel("wavelength (nm)")
-        self.samp_ax_spec.set_ylabel("normalized reflectance")
+        self.samp_ax_spec.set_ylabel("reflectance / max")
 
         self.samp_canvas = FigureCanvasTkAgg(self.samp_fig, master=parent)
 
@@ -248,6 +256,14 @@ class DetectorGUI:
                     self._set_status(payload)
                 elif kind == "cube_done":
                     self.hsi = payload
+                    self.raw_scores = None       # stale detection from a previous cube
+                    self.picked_xy = None
+                    self._remove_score_cbar()
+                    self.score_im = None
+                    self.pick_artists = []
+                    self.ax_score.clear()
+                    self.ax_score.set_title("detection score")
+                    self.ax_score.axis("off")
                     self._draw_rgb()
                     self._reinterp_reference()
                     self._busy(False)
@@ -262,15 +278,16 @@ class DetectorGUI:
                 elif kind == "samp_cube_done":
                     self.samp_hsi = payload
                     self._deactivate_polygon()       # drop any stale selector
-                    self.samp_slots = {"P1": None, "P2": None, "P3": None}
-                    self.samp_slot_n = {"P1": 0, "P2": 0, "P3": 0}
+                    self.samp_slots = {"A": None, "B": None}
+                    self.samp_slot_n = {"A": 0, "B": 0}
                     self.current_mean = None
+                    self.samp_gmax = None             # not normalized until the button is pressed
                     self.samp_wl = np.asarray(self.samp_hsi.centers, dtype=float)
                     self._draw_samp_rgb()
                     self._update_diff_plot()
                     self._samp_busy(False)
                     self._set_status(f"Image loaded: {self.samp_hsi.image.shape}. "
-                                     "Select a slot (P1/P2/P3), click 'Sample polygon' and draw.")
+                                     "Click 'Normalize (/max)', then sample A and B.")
                 elif kind == "error":
                     self._busy(False)
                     messagebox.showerror("Error", payload)
@@ -371,12 +388,61 @@ class DetectorGUI:
         if self.raw_scores is None:
             return
         thr = float(self.v_thr.get())
+        smax = float(np.nanmax(self.raw_scores)) if self.raw_scores.size else 0.0
+        vmax = smax if (np.isfinite(smax) and smax > 0) else 1.0
         disp = np.where(self.raw_scores >= thr, self.raw_scores, 0.0)
-        self.ax_score.clear()
+        # Rebuild the image+colorbar only when there is none yet or the shape
+        # changed (new detection); a threshold move just updates the data, so the
+        # colorbar is created once and never stacks up.
+        need_new = (self.score_im is None
+                    or self.score_im.get_array().shape != disp.shape)
+        if need_new:
+            self._remove_score_cbar()
+            self.ax_score.clear()
+            self.ax_score.axis("off")
+            self.score_im = self.ax_score.imshow(disp, cmap="magma", vmin=0.0, vmax=vmax)
+            self.score_cbar = self.fig.colorbar(self.score_im, ax=self.ax_score,
+                                                fraction=0.046, pad=0.04)
+            self.score_cbar.set_label("detection score", fontsize=8)
+            self.score_cbar.ax.tick_params(labelsize=7)
+            self.pick_artists = []
+        else:
+            self.score_im.set_data(disp)
+            self.score_im.set_clim(0.0, vmax)
         self.ax_score.set_title(f"detection score (thr={thr:.3f})")
-        self.ax_score.axis("off")
-        self.ax_score.imshow(disp, cmap="magma")
+        # refresh the clicked-pixel marker without wiping the image/colorbar
+        for a in self.pick_artists:
+            try:
+                a.remove()
+            except Exception:
+                pass
+        self.pick_artists = []
+        self._draw_pick_marker()
         self.canvas.draw_idle()
+
+    def _remove_score_cbar(self):
+        if self.score_cbar is not None:
+            try:
+                self.score_cbar.remove()
+            except Exception:
+                pass
+            self.score_cbar = None
+
+    def _draw_pick_marker(self):
+        """Mark the last-clicked pixel on the score map and label its detection value."""
+        if self.picked_xy is None or self.raw_scores is None:
+            return
+        x, y = self.picked_xy
+        h, w = self.raw_scores.shape[:2]
+        if not (0 <= x < w and 0 <= y < h):
+            return
+        val = float(self.raw_scores[y, x])
+        m, = self.ax_score.plot(x, y, marker="+", color="cyan", markersize=11, mew=1.6)
+        ann = self.ax_score.annotate(
+            f"{val:.3f}", (x, y), color="cyan", fontsize=8,
+            xytext=(5, 5), textcoords="offset points", ha="left", va="bottom",
+            bbox=dict(boxstyle="round,pad=0.15", fc="black", ec="none", alpha=0.55))
+        self.pick_artists = [m, ann]
 
     def on_click(self, event):
         if event.inaxes not in (self.ax_rgb, self.ax_score) or self.hsi is None:
@@ -387,8 +453,17 @@ class DetectorGUI:
         h, w = self.hsi.image.shape[:2]
         if not (0 <= x < w and 0 <= y < h):
             return
+        # detection value at this pixel (post-detection): mark it on the score map
+        score_txt = ""
+        if (self.raw_scores is not None
+                and y < self.raw_scores.shape[0] and x < self.raw_scores.shape[1]):
+            self.picked_xy = (x, y)
+            val = float(self.raw_scores[y, x])
+            score_txt = f"  score={val:.3f}"
+            self._redraw_scores()          # redraws the score map + the pick marker
+            self._set_status(f"Pixel ({x},{y}): detection score = {val:.4f}")
         self.ax_spec.clear()
-        self.ax_spec.set_title(f"pixel spectrum ({x},{y})")
+        self.ax_spec.set_title(f"pixel spectrum ({x},{y}){score_txt}")
         self.ax_spec.plot(self.hsi.centers, self.hsi.image[y, x, :], lw=1, label="pixel")
         if self.ref_disp is not None:
             r = self.ref_disp.intensities
@@ -554,61 +629,66 @@ class DetectorGUI:
                          "Pick the next slot & draw, or Export difference (CSV).")
 
     # ---- normalization + difference ----
-    def _norm_by_p1(self, mean):
-        """Min-max normalize `mean` using P1's own min & max. None if P1 unset/flat."""
-        m1 = self.samp_slots["P1"]
-        if m1 is None or mean is None:
+    def normalize_image(self):
+        """Normalize the whole image by dividing by its global max pixel value."""
+        if self.samp_hsi is None:
+            messagebox.showwarning("No image", "Open an image first.")
+            return
+        gmax = float(np.nanmax(self.samp_hsi.image))
+        if not np.isfinite(gmax) or gmax == 0:
+            messagebox.showwarning("Cannot normalize",
+                                   "Image max is 0 or non-finite - cannot divide by it.")
+            return
+        self.samp_gmax = gmax
+        self._update_diff_plot()
+        self._set_status(f"Image normalized by max={gmax:.4g}. "
+                         "Sample A and B, then Export difference (CSV).")
+
+    def _normalized(self, mean):
+        """Divide a region mean by the image's global max (divide-by-max)."""
+        if mean is None or self.samp_gmax is None:
             return None
-        lo, hi = np.nanmin(m1), np.nanmax(m1)
-        denom = hi - lo
-        if not np.isfinite(denom) or denom == 0:
-            return None
-        return (mean - lo) / denom
+        return mean / self.samp_gmax
 
     def _difference(self):
-        """N2 - N3 (or N3 - N2), both normalized by P1. None if not all set."""
-        n2 = self._norm_by_p1(self.samp_slots["P2"])
-        n3 = self._norm_by_p1(self.samp_slots["P3"])
-        if n2 is None or n3 is None:
+        """(A - B) or (B - A), both divided by the image max. None if A/B not set."""
+        na = self._normalized(self.samp_slots["A"])
+        nb = self._normalized(self.samp_slots["B"])
+        if na is None or nb is None:
             return None
-        return (n2 - n3) if self.samp_dir.get() == "P2 - P3" else (n3 - n2)
+        return (na - nb) if self.samp_dir.get() == "A - B" else (nb - na)
 
     def _slots_summary(self):
         return " ".join(f"{k}[{'set' if self.samp_slots[k] is not None else '-'}]"
-                        for k in ("P1", "P2", "P3"))
+                        for k in ("A", "B"))
 
     def _update_diff_plot(self):
         ax = self.samp_ax_spec
         ax.clear()
         ax.set_xlabel("wavelength (nm)")
+        normalized = self.samp_gmax is not None
+        ax.set_ylabel("reflectance / max" if normalized else "reflectance (raw)")
         wl = self.samp_wl
-        have_p1 = self.samp_slots["P1"] is not None
-        colors = {"P1": "0.6", "P2": "tab:blue", "P3": "tab:green"}
+        colors = {"A": "tab:blue", "B": "tab:green"}
         any_slot = False
-        for key in ("P1", "P2", "P3"):
+        for key in ("A", "B"):
             m = self.samp_slots[key]
             if m is None or wl is None:
                 continue
             any_slot = True
-            y = self._norm_by_p1(m) if have_p1 else m
-            if y is None:
-                continue
-            n = self.samp_slot_n[key]
-            if key == "P1":
-                ax.plot(wl, y, ":", color=colors[key], lw=1.0,
-                        label=f"P1 normalizer (n={n})")
-            else:
-                lbl = f"{key} norm (n={n})" if have_p1 else f"{key} raw (n={n})"
-                ax.plot(wl, y, "-", color=colors[key], lw=1.0, label=lbl)
-        diff = self._difference()
+            y = self._normalized(m) if normalized else m
+            tag = "normalized" if normalized else "raw"
+            ax.plot(wl, y, "-", color=colors[key], lw=1.0,
+                    label=f"{key} {tag} (n={self.samp_slot_n[key]})")
+        diff = self._difference()          # None until BOTH slots set AND normalized
         if diff is not None:
             ax.plot(wl, diff, "r-", lw=1.7, label=self.samp_dir.get())
             ax.axhline(0.0, color="0.85", lw=0.8, zorder=0)
-            ax.set_ylabel("min-max normalized (by P1) / difference")
             ax.set_title(f"difference {self.samp_dir.get()}")
+        elif not normalized:
+            ax.set_title("click 'Normalize (/max)', then sample A and B")
         else:
-            ax.set_ylabel("min-max normalized (by P1)" if have_p1 else "reflectance (raw)")
-            ax.set_title("sample P1 (normalizer), then P2 and P3")
+            ax.set_title("sample A and B")
         if any_slot:
             ax.legend(fontsize=7)
         self.samp_canvas.draw_idle()
@@ -616,27 +696,28 @@ class DetectorGUI:
     def export_difference(self):
         diff = self._difference()
         if diff is None:
+            norm = "yes" if self.samp_gmax is not None else "NO - click 'Normalize (/max)'"
             messagebox.showwarning(
                 "Not ready",
-                "Need P1 (normalizer), P2 and P3 all sampled first.\n"
-                f"Current: {self._slots_summary()}")
+                "Need the image normalized and both polygons A and B sampled.\n"
+                f"Normalized: {norm}\nSlots: {self._slots_summary()}")
             return
         path = filedialog.asksaveasfilename(
             title="Export subtracted spectrum",
             defaultextension=".csv", filetypes=[("CSV", "*.csv"), ("All files", "*.*")])
         if not path:
             return
-        col = self.samp_dir.get().replace(" ", "")   # e.g. P2-P3
+        col = self.samp_dir.get().replace(" ", "")   # e.g. A-B
         np.savetxt(path, np.column_stack([self.samp_wl, diff]), delimiter=",",
                    header=f"wavelength,{col}", comments="")
         self._set_status(f"Exported {self.samp_dir.get()} difference "
                          f"({len(diff)} bands) to {os.path.basename(path)}")
 
     def clear_slots(self):
-        self.samp_slots = {"P1": None, "P2": None, "P3": None}
-        self.samp_slot_n = {"P1": 0, "P2": 0, "P3": 0}
+        self.samp_slots = {"A": None, "B": None}
+        self.samp_slot_n = {"A": 0, "B": 0}
         self._update_diff_plot()
-        self._set_status("Cleared P1/P2/P3. Sample again.")
+        self._set_status("Cleared A/B. Sample again.")
 
     def save_spectrum(self):
         """Save the last-drawn polygon's raw mean reflectance as a 2xN .npy/.csv."""

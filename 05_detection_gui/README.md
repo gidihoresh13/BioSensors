@@ -5,9 +5,9 @@ A minimal **desktop GUI** (Tkinter) with two tabs:
 - **Detection** -- load a hyperspectral cube, pick a reference spectrum, run the
   unmixing classifier, tune the detection threshold live, inspect per-pixel
   spectra, and export results.
-- **Spectrum sampler** -- load a *separate* hyperspectral image and draw three
-  polygons: **P1** sets a min-max normalization, **P2** and **P3** are normalized
-  by it and **subtracted**; export the difference spectrum to CSV.
+- **Spectrum sampler** -- load a *separate* hyperspectral image (normalized by
+  dividing by its max), draw **two** polygons **A** and **B**, subtract one from
+  the other (either direction), and export the difference spectrum to CSV.
 
 This folder is **self-contained** -- it ships its own copy of the detection
 engine (the [`hsi_detect`](hsi_detect) package), so it has no dependency on
@@ -19,16 +19,22 @@ other modules. (The engine originates from `04_image_processing`.)
 |------|--------|----------------|
 | 1 | **Open cube (.hdr)** | `HyperspectralImage` loads the ENVI cube, smooths, renders RGB |
 | 2 | **Open reference** | `Spectrum` loads a 2xN `.npy`/`.csv`, interpolated to the cube's bands |
-| 3 | **Run detection** | `HierarchicalKMeansUnmixer.fit` + `.classify` on a background thread |
+| 3 | **Run detection** | `HierarchicalKMeansUnmixer.fit` + `.classify` on a background thread; the score map gets a **colorbar** (value scale, fixed 0..max) on its side |
 | 4 | **Threshold slider** | re-applies the threshold to the cached score map (no re-fit) |
-| 5 | **Click a pixel** | plots that pixel's spectrum against the reference |
+| 5 | **Click a pixel** | plots its spectrum vs. the reference; **after detection**, marks the pixel and prints its **detection score** on the score map (and status bar) |
 | 6 | **Export** | writes `<date>_score.tiff`, `<date>_detection_view.png`, `<date>_params.json` |
 
 Layout: **RGB | detection score | pixel spectrum**.
 
+Clicking a pixel on either the RGB or the score image (after running detection)
+drops a cyan **+** at that pixel on the score map and labels it with the raw
+detection value; the value also appears in the status bar and the spectrum-panel
+title. The marker survives threshold-slider changes and is cleared when a new cube
+is loaded.
+
 ## Tab 2 -- Spectrum sampler
 
-Builds a **difference spectrum** from three hand-drawn regions of a hyperspectral
+Builds a **difference spectrum** from two hand-drawn regions of a hyperspectral
 image. It is fully **independent** of the Detection tab -- open any cube here,
 including a different one from the detection cube.
 
@@ -36,31 +42,33 @@ including a different one from the detection cube.
 > only exists if the file has spectral bands; an ordinary RGB photo has just
 > three channels and cannot produce one.
 
-The idea: sample three regions. **P1** is a normalizer -- its mean reflectance's
-min and max define a **Spectronon-style min-max normalization applied to the whole
-image**: `N = (value - min(P1)) / (max(P1) - min(P1))`. **P2** and **P3** are two
-regions sampled from that normalized image; one is subtracted from the other and
-the difference is exported. (Because min-max is a linear rescale, sampling P2/P3
-after normalization gives the same result as averaging each region then rescaling
-by P1's min/max -- which is how it's computed.)
+The idea: **Normalize** divides the whole image by its maximum pixel value
+(`value / max(image)`). You then sample two regions **A** and **B**; each region's
+normalized mean is `mean(region) / max(image)`, and one is subtracted from the
+other. The difference is exported. (Because divide-by-max is a linear rescale,
+sampling A/B from the normalized image gives the same result as averaging each
+region then dividing by the max -- which is how it's computed.)
 
 1. **Open image (.hdr)** -- loads the cube at full resolution and renders it
-   (left panel), so region boundaries stay precise.
-2. Pick the **store into** slot (`P1 (normalizer)`, `P2`, or `P3`).
-3. **Sample polygon** (button turns into *Stop sampling*); click vertices on the
+   (left panel).
+2. **Normalize (/max)** -- click the button; it divides the whole image by its
+   max pixel value (shown in the status bar). Do this before sampling; the
+   difference/export stay disabled until the image is normalized.
+3. Pick the **store into** slot (`A` or `B`).
+4. **Sample polygon** (button turns into *Stop sampling*); click vertices on the
    image, click the first vertex to close (Esc restarts the shape). The polygon's
-   **mean reflectance** is stored into the selected slot.
-4. Repeat for the other slots. Once **P1** is set, P2/P3 are shown min-max
-   normalized: `N = (mean - min(P1)) / (max(P1) - min(P1))`.
-5. Choose the **Subtract** direction (`P2 - P3` or `P3 - P2`). Once all three
-   slots are filled, the difference `N2 - N3` (or `N3 - N2`) is drawn in bold.
-6. **Export difference (CSV)...** -- writes a 2-column CSV: `wavelength` and the
-   subtracted spectrum (header names the direction, e.g. `wavelength,P2-P3`).
+   **mean reflectance** is stored into the selected slot and shown divided by the
+   image max.
+5. Do the same for the other slot.
+6. Choose the **Subtract** direction (`A - B` or `B - A`). Once both slots are
+   filled, the difference is drawn in bold.
+7. **Export difference (CSV)...** -- writes a 2-column CSV: `wavelength` and the
+   subtracted spectrum (header names the direction, e.g. `wavelength,A-B`).
 
-Extras: **Clear P1/P2/P3** resets the slots; **Save current mean (.npy)...** saves
-the last-drawn polygon's raw mean reflectance as a 2xN `.npy`/`.csv` (loads back
-via the Detection tab's *Open reference*). No absorbance or continuum removal is
-applied -- these are raw reflectance means.
+Extras: **Clear A/B** resets the slots; **Save current mean (.npy)...** saves the
+last-drawn polygon's raw mean reflectance as a 2xN `.npy`/`.csv` (loads back via
+the Detection tab's *Open reference*). No absorbance or continuum removal is
+applied -- these are raw reflectance means, normalized only by the image max.
 
 Layout: **image (draw here) | normalized means + difference**.
 
