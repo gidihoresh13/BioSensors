@@ -303,7 +303,7 @@ class DetectorGUI:
     # ================= detection tab =================
     def open_cube(self):
         path = filedialog.askopenfilename(title="Select ENVI header",
-                                          filetypes=[("ENVI header", "*.hdr"), ("All files", "*.*")])
+                                          filetypes=[("ENVI cube", "*.hdr *.raw"), ("ENVI header", "*.hdr"), ("Raw data", "*.raw"), ("All files", "*.*")])
         if not path:
             return
         d = max(1, int(self.v_down.get()))
@@ -505,7 +505,7 @@ class DetectorGUI:
         """Load a SEPARATE hyperspectral cube to sample a reference spectrum from."""
         path = filedialog.askopenfilename(
             title="Select ENVI header of the image to sample",
-            filetypes=[("ENVI header", "*.hdr"), ("All files", "*.*")])
+            filetypes=[("ENVI cube", "*.hdr *.raw"), ("ENVI header", "*.hdr"), ("Raw data", "*.raw"), ("All files", "*.*")])
         if not path:
             return
         self._samp_busy(True)
