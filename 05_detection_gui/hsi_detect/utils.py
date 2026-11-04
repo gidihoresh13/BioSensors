@@ -3,7 +3,7 @@ import numpy as np
 import scipy
 from sklearn.cluster import MiniBatchKMeans, AgglomerativeClustering
 from sklearn.decomposition import PCA
-from scipy.ndimage import uniform_filter
+from scipy.signal import savgol_filter
 from scipy.optimize import curve_fit
 import matplotlib.pyplot as plt
 from matplotlib.patches import ConnectionPatch
@@ -494,24 +494,32 @@ def smooth_spectrum(spectrum, window_size=3):
     
     return smoothed_spectrum
 
-def smooth_img_spectrum(im_array, window_size):
+def smooth_img_spectrum(im_array, window_size, polyorder=3):
     """
-    Perform sliding window averaging on axis 2 of a 3D NumPy matrix.
+    Apply a Savitzky-Golay filter along axis 2 (wavelength) of a 3D NumPy matrix.
 
     Parameters:
     - matrix: 3D NumPy array
-    - window_size: Size of the sliding window
+    - window_size: Odd filter window length (in bands)
+    - polyorder: Order of the fitted polynomial (must be < window_size)
 
     Returns:
-    - A new matrix with sliding window averages applied along axis 2
+    - A new matrix with the Savitzky-Golay filter applied along axis 2
     """
     if im_array.ndim != 3:
         raise ValueError("Input matrix must be 3D")
 
     if window_size <= 0 or window_size > im_array.shape[2]:
         raise ValueError("Invalid window size")
-        
-    output_matrix = uniform_filter(im_array, size=(1, 1, window_size), mode='nearest')
+
+    if window_size % 2 == 0:
+        raise ValueError("Window size must be an odd number.")
+
+    if polyorder >= window_size:
+        raise ValueError("polyorder must be less than window_size")
+
+    output_matrix = savgol_filter(im_array, window_length=window_size, polyorder=polyorder,
+                                  axis=2, mode='nearest')
 
     return output_matrix
 

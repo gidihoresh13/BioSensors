@@ -40,7 +40,7 @@ class HyperspectralImage:
         self.image_path = hdr
         self.lib = envi.open(hdr, data)
         self.image = self.lib.load()
-        self.image = utils.smooth_img_spectrum(self.image, window_size=11)
+        self.image = utils.smooth_img_spectrum(self.image, window_size=smoothing_window)
         self.centers = self.lib.bands.centers
         self.rgb = None
 
