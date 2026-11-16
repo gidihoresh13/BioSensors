@@ -64,6 +64,14 @@ except ModuleNotFoundError as e:
     )
 
 
+def _image_number(path):
+    """Number part of the image file name (e.g. 'img_0123.hdr' -> '0123')."""
+    import re
+    stem = os.path.splitext(os.path.basename(path))[0]
+    m = re.findall(r"\d+", stem)
+    return m[0] if m else stem
+
+
 class DetectorGUI:
     def __init__(self, root):
         self.root = root
@@ -313,6 +321,7 @@ class DetectorGUI:
         def work():
             try:
                 hsi = HyperspectralImage(path)
+                hsi.name = _image_number(path)
                 if d > 1:
                     hsi.image = hsi.image[::d, ::d, :]
                     hsi.rgb = None
@@ -379,7 +388,7 @@ class DetectorGUI:
 
     def _draw_rgb(self):
         self.ax_rgb.clear()
-        self.ax_rgb.set_title("RGB")
+        self.ax_rgb.set_title(getattr(self.hsi, "name", "RGB"))
         self.ax_rgb.axis("off")
         self.ax_rgb.imshow(self.hsi.rgb.astype(np.uint8))
         self.canvas.draw_idle()
@@ -400,7 +409,7 @@ class DetectorGUI:
             self._remove_score_cbar()
             self.ax_score.clear()
             self.ax_score.axis("off")
-            self.score_im = self.ax_score.imshow(disp, cmap="magma", vmin=0.0, vmax=vmax)
+            self.score_im = self.ax_score.imshow(disp, cmap="jet", vmin=0.0, vmax=vmax)
             self.score_cbar = self.fig.colorbar(self.score_im, ax=self.ax_score,
                                                 fraction=0.046, pad=0.04)
             self.score_cbar.set_label("detection score", fontsize=8)
@@ -516,6 +525,7 @@ class DetectorGUI:
                 # full resolution: the sampler needs precise region boundaries,
                 # and striding here would not save the (already-done) full load
                 hsi = HyperspectralImage(path)
+                hsi.name = _image_number(path)
                 hsi.make_rgb()
                 self.q.put(("samp_cube_done", hsi))
             except Exception:
@@ -526,7 +536,7 @@ class DetectorGUI:
 
     def _draw_samp_rgb(self):
         self.samp_ax_rgb.clear()
-        self.samp_ax_rgb.set_title("image")
+        self.samp_ax_rgb.set_title(getattr(self.samp_hsi, "name", "image"))
         self.samp_ax_rgb.axis("off")
         self.samp_ax_rgb.imshow(self.samp_hsi.rgb.astype(np.uint8))
         # remember the full-image view so scroll-out can't zoom past it, and so
